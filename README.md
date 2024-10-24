@@ -134,6 +134,14 @@ def custom_generate_with_special_words_filter(
 
 The tool will return a generated text that avoids the predefined sensitive words, maintaining the fluency and relevance of the generated output.
 
+
+## TODO List
+- [ ] Custom decode prototype
+- [ ] Support batch decode
+- [ ] Support transformers library rollback
+- [ ] Support vLLM
+
+
 ## Contribution
 
 If you'd like to contribute to this project:
