@@ -31,91 +31,91 @@ pip install torch transformers
 Below is a sample code snippet showcasing how to use the tool:
 
 ```python
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-# Initialize model and tokenizer
-model = AutoModelForCausalLM.from_pretrained('gpt2')
-tokenizer = AutoTokenizer.from_pretrained('gpt2')
-
-# Define sensitive words
-sensitive_words = ["listen", "example_sensitive_word"]
-
-# Input prompt
-input_text = "Let's discuss a topic."
-
-# Tokenize input
-input_ids = tokenizer(input_text, return_tensors="pt").input_ids
-
-# Call the custom generation function
-generated_text = custom_generate_with_special_words_filter(
-    input_ids=input_ids,
-    special_words=sensitive_words,
-    max_length=50
+response = custom_generate_with_fsm_filter(
+    input_ids=inputs.input_ids,
+    fsm_processor=fsm_processor,
+    max_length=50,
 )
-
-print(generated_text)
 ```
+
 
 ### Function Explanation
 
 ```python
-def custom_generate_with_special_words_filter(
+def custom_generate_with_fsm_filter(
     input_ids: torch.Tensor,
-    special_words: List[str],
+    fsm_processor: FSMProcessor,
     max_length: int = 20,
 ) -> str:
     # Historical mask list used to record masked tokens at each decoding step
     masked_tokens_history = {}
+    past_key_values = None
+    steps = 0
 
-    for step in range(max_length):
-        # Generate new tokens
-        outputs = model(input_ids, return_dict=True, use_cache=True)
+    while steps < max_length:
+        steps += 1
+
+        # Generate new token with kv cache
+        outputs = model(input_ids, past_key_values=past_key_values, return_dict=True, use_cache=True)
         logits = outputs.logits[:, -1, :]
 
+        # Update kv cache
+        past_key_values = outputs.past_key_values
+
         # Check if there are already masked tokens at the current step
-        if step in masked_tokens_history:
-            for token_id in masked_tokens_history[step]:
-                logits[:, token_id] = -float("inf")  # Mask previously invalid tokens
+        if steps in masked_tokens_history:
+            for masked_token_id in masked_tokens_history[steps]:
+                logits[:, masked_token_id] = -float("inf")
+        else:
+            masked_tokens_history[steps] = set()
 
-        # Generate the token
-        generated_token = torch.argmax(logits, dim=-1)
-        combined_ids = torch.cat((input_ids, generated_token.unsqueeze(0)), dim=-1)
-        combined_text = tokenizer.decode(combined_ids[0], skip_special_tokens=True)
+        # Decode the generated token
+        generated_token_id = torch.argmax(logits, dim=-1).item()
+        combined_ids = torch.cat((input_ids, torch.tensor([[generated_token_id]], device=input_ids.device)), dim=-1)
 
-        # Check for each sensitive word
-        for special_word in special_words:
-            if special_word in combined_text:
-                # Convert the sensitive word into tokens
-                special_word_tokenized = tokenizer(special_word, return_tensors="pt", add_special_tokens=False).input_ids
-                special_word_length = special_word_tokenized.shape[1]
-                print(f"Detect special word: {special_word}\n Start roll-back process...")
+        # Check FSM for sensitive sequences
+        if fsm_processor.detect(generated_token_id):
+            # Detected a sensitive sequence, initiate rollback
+            rollback_length = fsm_processor.partial_match_state + 1 if fsm_processor.partial_match_state is not None else 1
+            steps = steps - rollback_length + 1
+            rollbacks_ids = combined_ids[:, :-rollback_length]
+            input_ids = rollbacks_ids
+            print(f"Rollback detected. Rolling back from step {steps + rollback_length} to step {steps}")
 
-                # Roll back to before the sensitive word
-                rollbacks_ids = combined_ids[:, :-special_word_length]
-                input_ids = rollbacks_ids
-                print(f"Roll back from {combined_ids.shape[1]} to {rollbacks_ids.shape[1]}")
+            # Reset FSM state
+            fsm_processor.curr_state = 0
+            fsm_processor.partial_match_state = None
 
-                # Recalculate logits based on the rolled-back sequence
-                outputs = model(input_ids, return_dict=True, use_cache=True)
-                logits = outputs.logits[:, -1, :]  # Recalculate logits based on rolled-back input
+            # Reset past_key_values when rolling back
+            past_key_values = None
 
-                # Only mask the first token of the sensitive word
-                first_token_id = special_word_tokenized[0, 0]
-                print(f"Masking token: {tokenizer.decode(first_token_id)}")
-                logits[:, first_token_id] = -float("inf")  # Mask the first token of the sensitive word
+            # Recalculate logits based on rolled-back sequence
+            outputs = model(input_ids, return_dict=True, use_cache=True)
+            logits = outputs.logits[:, -1, :]
+            past_key_values = outputs.past_key_values
 
-                # Update the historical mask list to record the token at this step
-                if step not in masked_tokens_history:
-                    masked_tokens_history[step] = set()
-                masked_tokens_history[step].add(first_token_id)
+            # Mask the first token of the sensitive sequence
+            first_token_id = generated_token_id
+            print(f"Masking token id: {first_token_id}, Masking token: {tokenizer.decode(first_token_id)}")
 
-        # Generate the next token
-        new_generated_token = torch.argmax(logits, dim=-1)
-        print(f"Generated token: {tokenizer.decode(new_generated_token)}")
-        input_ids = torch.cat((input_ids, new_generated_token.unsqueeze(0)), dim=1)
+            # Update the historical mask list to record the token at this step
+            masked_tokens_history[steps].add(first_token_id)
 
-    return tokenizer.decode(input_ids[0], skip_special_tokens=True)
+            for masked_token_id in masked_tokens_history[steps]:
+                logits[:, masked_token_id] = -float("inf")
+
+            # Generate the token again after masking
+            generated_token_id = torch.argmax(logits, dim=-1).item()
+
+        # Update input_ids with the generated token
+        input_ids = torch.cat((input_ids, torch.tensor([[generated_token_id]], device=input_ids.device)), dim=1)
+
+        print(f"Step {steps}: ID: {generated_token_id} Generated token: {tokenizer.decode(generated_token_id)}")
+
+        if generated_token_id == tokenizer.eos_token_id:
+            break
+
+    return tokenizer.decode(input_ids[0], skip_special_tokens=False)
 ```
 
 ### Parameters
@@ -136,7 +136,7 @@ The tool will return a generated text that avoids the predefined sensitive words
 
 
 ## TODO List
-- [ ] Custom decode prototype
+- [X] Custom decode prototype
 - [ ] Support batch decode
 - [ ] Support transformers library rollback
 - [ ] Support vLLM
